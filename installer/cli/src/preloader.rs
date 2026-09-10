@@ -1,6 +1,6 @@
 use crate::command::CommandError;
 use serialport::SerialPortType;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Duration;
 
 const R1_PRELOADER_VENDOR: u16 = 0x0e8d;
@@ -8,13 +8,22 @@ const R1_PRELOADER_PRODUCT: u16 = 0x2000;
 const FASTBOOT_PAYLOAD: &[u8; 8] = b"FASTBOOT";
 
 pub fn try_enter() -> Result<bool, CommandError> {
-    let ports = serialport::available_ports().map_err(|error| {
-        CommandError::new(
-            "JR-CLI-PRELOADER-ENUMERATE",
-            format!("cannot enumerate serial devices: {error}"),
-        )
-    })?;
-    let candidates: Vec<_> = ports
+    let ports = match serialport::available_ports() {
+        Ok(ports) => ports,
+        #[cfg(windows)]
+        Err(error) => {
+            eprintln!("Serial metadata enumeration failed ({error}); checking present Windows PnP hardware IDs.");
+            Vec::new()
+        }
+        #[cfg(not(windows))]
+        Err(error) => {
+            return Err(CommandError::new(
+                "JR-CLI-PRELOADER-ENUMERATE",
+                format!("cannot enumerate serial devices: {error}"),
+            ))
+        }
+    };
+    let mut candidates: Vec<_> = ports
         .into_iter()
         .filter_map(|port| match port.port_type {
             SerialPortType::UsbPort(info)
@@ -25,8 +34,20 @@ pub fn try_enter() -> Result<bool, CommandError> {
             _ => None,
         })
         .collect();
+    #[cfg(windows)]
+    candidates.extend(windows::preloader_ports()?);
+    candidates.sort();
+    candidates.dedup();
     match select_exact(&candidates)? {
         Some(path) => {
+            // A present PnP node and its saved COM name can precede driver start.
+            // Count all exact candidates first so startup cannot hide a second R1.
+            #[cfg(windows)]
+            if !windows::port_started(path)? {
+                println!("Preloader observed on {path}; waiting for Windows to start its driver.");
+                return Ok(false);
+            }
+            println!("Preloader observed: 0e8d:2000 on {path}. Waiting for READY…");
             let mut port = serialport::new(path, 115_200)
                 .timeout(Duration::from_secs(3))
                 .open()
@@ -36,18 +57,39 @@ pub fn try_enter() -> Result<bool, CommandError> {
                         format!("cannot open the exact R1 preloader port: {error}"),
                     )
                 })?;
-            port.write_all(FASTBOOT_PAYLOAD).map_err(|error| {
-                CommandError::new(
-                    "JR-CLI-PRELOADER-WRITE",
-                    format!("cannot send the R1 FASTBOOT entry command: {error}"),
-                )
-            })?;
+            send_after_ready(&mut port)?;
             println!("FASTBOOT entry command sent. Waiting for the R1 FASTBOOT screen…");
             Ok(true)
         }
         None => Ok(false),
     }
 }
+
+fn send_after_ready(port: &mut (impl Read + Write)) -> Result<(), CommandError> {
+    let mut ready = [0u8; 5];
+    port.read_exact(&mut ready).map_err(|error| {
+        CommandError::new(
+            "JR-CLI-PRELOADER-READY",
+            format!("cannot read the five-byte READY handshake; no command sent: {error}"),
+        )
+    })?;
+    if &ready != b"READY" {
+        return Err(CommandError::new(
+            "JR-CLI-PRELOADER-READY",
+            "preloader did not return exact READY; no command sent",
+        ));
+    }
+    port.write_all(FASTBOOT_PAYLOAD).map_err(|error| {
+        CommandError::new(
+            "JR-CLI-PRELOADER-WRITE",
+            format!("cannot send the R1 FASTBOOT entry command: {error}"),
+        )
+    })
+}
+
+#[cfg(windows)]
+#[path = "preloader_windows.rs"]
+mod windows;
 
 fn select_exact(candidates: &[String]) -> Result<Option<&str>, CommandError> {
     let distinct = dedupe_logical(candidates);
@@ -92,6 +134,70 @@ fn logical_device_key(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{select_exact, FASTBOOT_PAYLOAD, R1_PRELOADER_PRODUCT, R1_PRELOADER_VENDOR};
+    use std::io::{self, Read, Write};
+
+    struct Port {
+        input: &'static [u8],
+        output: Vec<u8>,
+        timeout: bool,
+    }
+    impl Read for Port {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.timeout {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            // Deliberately fragment READY into single-byte serial reads.
+            self.input.read(&mut buffer[..1])
+        }
+    }
+    impl Write for Port {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn exact_fragmented_ready_sends_only_eight_bytes() {
+        let mut port = Port {
+            input: b"READY",
+            output: vec![],
+            timeout: false,
+        };
+        super::send_after_ready(&mut port).unwrap();
+        assert_eq!(port.output, b"FASTBOOT");
+    }
+    #[test]
+    fn invalid_truncated_or_timed_out_ready_never_writes() {
+        for input in [&b""[..], &b"READ"[..], &b"ready"[..], &b"xREADY"[..]] {
+            let mut port = Port {
+                input,
+                output: vec![],
+                timeout: false,
+            };
+            assert_eq!(
+                super::send_after_ready(&mut port).unwrap_err().code(),
+                "JR-CLI-PRELOADER-READY"
+            );
+            assert!(port.output.is_empty());
+        }
+        let mut port = Port {
+            input: b"READY",
+            output: vec![],
+            timeout: true,
+        };
+        assert!(super::send_after_ready(&mut port).is_err());
+        assert!(port.output.is_empty());
+    }
+    #[test]
+    fn duplicate_windows_sources_are_one_device() {
+        assert_eq!(
+            select_exact(&["COM6".into(), "COM6".into()]).unwrap(),
+            Some("COM6")
+        );
+        assert!(select_exact(&["COM6".into(), "COM7".into()]).is_err());
+    }
 
     #[test]
     fn entry_identity_and_payload_are_closed() {

@@ -272,6 +272,11 @@ fn enter_or_find_fastboot(
             return wait_for_mode(fastboot, false, input, output);
         }
         if fastboot.try_bind_one()?.is_some() {
+            writeln!(
+                output,
+                "FASTBOOT device observed. Checking mode and R1 identity…"
+            )
+            .map_err(io_error)?;
             normalize_connected_fastboot(fastboot, input, output)?;
             return Ok(());
         }
@@ -341,7 +346,15 @@ fn wait_for_mode(
 ) -> Result<(), CommandError> {
     loop {
         match fastboot.wait_for_mode(userspace) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                writeln!(
+                    output,
+                    "FASTBOOT observed: {}.",
+                    if userspace { "fastbootd" } else { "bootloader" }
+                )
+                .map_err(io_error)?;
+                return Ok(());
+            }
             Err(error) if error.code() == "JR-CLI-USB-PERMISSION" => {
                 writeln!(output, "\n{}", error).map_err(io_error)?;
                 writeln!(
