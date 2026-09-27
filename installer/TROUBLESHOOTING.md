@@ -73,6 +73,15 @@ Do not run the JackRabbit installer binary with `sudo`.
 
 ### Windows cannot see the R1 after its mode changes
 
+If Windows blocks `usb2ser.sys`, repeating the bundled driver installation may
+repeat the problem. On one tested Windows host, the bundled CDC driver
+`3.0.1504.0` failed Memory Integrity enforcement. A matching Windows Update
+MediaTek Ports `3.0.1511.0` package successfully started with Memory Integrity
+enabled and supported a complete installation. Check the hardware match and
+retain a rollback copy before updating. Choose `S` at the driver prompt when
+working drivers are already installed. This change does not replace the bundled
+driver package or disable Windows security settings.
+
 Run `install.cmd` again and choose the included driver install/repair path.
 Approve the Rabbit MediaTek preloader driver and Google fastboot driver prompts.
 Windows treats the preloader, bootloader FASTBOOT, and fastbootd as different
